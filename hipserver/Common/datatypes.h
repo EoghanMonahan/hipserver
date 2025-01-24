@@ -96,11 +96,11 @@ typedef unsigned char uint8_t;
 # endif
 #endif   /* ifndef SIZE64_T */
 
-// typedef enum
-// {
-//   0,
-//   1
-// } bool_t;
+typedef enum
+{
+  FALSE,
+  TRUE
+} bool_t;
 
 typedef enum hartTypes_e
 {
