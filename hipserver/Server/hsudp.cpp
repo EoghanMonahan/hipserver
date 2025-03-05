@@ -36,6 +36,7 @@
 #include "hsrequest.h"
 #include "hssubscribe.h"
 #include "app.h"
+#include "ad74416h.h"
 
 #include <sys/select.h>
 
@@ -45,6 +46,7 @@
 
 extern uint16_t portNum;
 extern int connectionType;
+extern struct ad74416h_desc *ad74416h;
 
 /************************************
  *  Private variables for this file
@@ -71,6 +73,7 @@ static errVal_t handle_sess_close_req(hartip_msg_t *p_request,
 static errVal_t handle_sess_init_req(hartip_msg_t *p_request,
 		hartip_msg_t *p_response, sockaddr_in_t client_addr);
 static errVal_t handle_token_passing_req(hartip_msg_t *p_request, uint8_t sessNum);
+static errVal_t handle_token_passthrough(hartip_msg_t *p_request, hartip_msg_t *p_response, uint8_t sessNum);
 static errVal_t handle_keepalive_req(hartip_msg_t *p_request,
 		hartip_msg_t *p_response, uint8_t sessNum);
 static bool is_client_sess_valid(sockaddr_in_t *client_sockaddr,
@@ -254,7 +257,7 @@ void *socketThrFunc(void *thrName)
 			pCurrentSession = &ClientSessTable[sessNum];
 			dbgp_hs("Current Session #%d\n", sessNum);
 		}
-
+		
 		// Clear struct before usage
 		memset_s(&rspToClient, sizeof(rspToClient), 0);
 
@@ -299,7 +302,7 @@ void *socketThrFunc(void *thrName)
 		case HARTIP_MSG_ID_TP_PDU:
 			dbgp_logdbg("Token-Passing PDU\n");
 			printf("Token-Passing PDU\n");
-			errval = handle_token_passing_req(&reqFromClient, sessNum);
+			errval = handle_token_passthrough(&reqFromClient, &rspToClient, sessNum);
 			if (errval != NO_ERROR)
 			{
 				print_to_both(p_toolLogPtr,
@@ -579,6 +582,138 @@ static errVal_t handle_sess_close_req(hartip_msg_t *p_request,
 
 		send_rsp_to_client(p_response, &ClientSessTable[sessNum]);
 		clear_session_info(sessNum);
+	} while (FALSE);
+
+	return (errval);
+}
+
+/**
+ * handle_token_passthrough(): pass hart command through to device and return
+ * response to the client
+ */
+static errVal_t handle_token_passthrough(hartip_msg_t *p_request,
+		hartip_msg_t *p_response, uint8_t sessNum)
+{
+	errVal_t errval = NO_ERROR;
+	uint16_t reg_read;
+	uint16_t byte_count;
+	int ret;
+	int i;
+
+	const char *funcName = "handle_sess_close_req";
+	dbgp_trace("~~~~~~ %s ~~~~~~\n", funcName);
+
+	do
+	{
+		if (p_request == NULL)
+		{
+			errval = POINTER_ERROR;
+			print_to_both(p_toolLogPtr, "NULL pointer (req) passed to %s\n",
+					funcName);
+			break;
+		}
+		if (p_response == NULL)
+		{
+			errval = POINTER_ERROR;
+			print_to_both(p_toolLogPtr, "NULL pointer (rsp) passed to %s\n",
+					funcName);
+			break;
+		}
+
+		/* Start with a clean slate */
+		memset_s(p_response, sizeof(*p_response), 0);
+
+		hartip_hdr_t *p_reqHdr = &p_request->hipHdr;
+		hartip_hdr_t *p_rspHdr = &p_response->hipHdr;
+
+			/* Clear the Transmit FIFO. */
+		ret = ad74416h_reg_update(ad74416h, AD74416H_HART_FCR(0),
+					NO_OS_BIT(2), 1);
+		if (ret)
+			printf("%s:%d: error\n", __func__, __LINE__);
+
+		/* Clear the Receive FIFO. */
+		ret = ad74416h_reg_update(ad74416h, AD74416H_HART_FCR(0),
+					NO_OS_BIT(1), 1);
+		if (ret)
+			printf("%s:%d: error\n", __func__, __LINE__);
+
+		/* Load the HART transmit first in first out (FIFO) with data required
+		for transmission */
+		printf("Request (TX FIFO Byte Count: %d):\r\n",
+			sizeof(p_request->hipTPPDU)/sizeof(p_request->hipTPPDU[0]));
+		/* Preamble bytes*/
+		for (i = 0; i < 10; i++) {
+			ret = ad74416h_reg_write(ad74416h, AD74416H_HART_TX(0), 0xFF);
+			if (ret)
+				printf("%s:%d: error\n", __func__, __LINE__);
+			printf("%02X ", 0xFF);
+		}
+		/* Actual HART message*/
+		for (i = 0; i < sizeof(p_request->hipTPPDU)/sizeof(p_request->hipTPPDU[0]); i++) {
+			ret = ad74416h_reg_write(ad74416h, AD74416H_HART_TX(0),
+						p_request->hipTPPDU[i]);
+			if (ret)
+				printf("%s:%d: error\n", __func__, __LINE__);
+			printf("%02X ", p_request->hipTPPDU[i]);
+		}
+		printf("\r\n");
+
+		/* Ensure that the HART alerts are cleared */
+		ret = ad74416h_reg_write(ad74416h, AD74416H_HART_ALERT_STATUS(0),
+					0xffff);
+		if (ret)
+			printf("%s:%d: error\n", __func__, __LINE__);
+
+		/* Set the RTS bit (request to send) to start HART transmissions */
+		ret = ad74416h_reg_write(ad74416h, AD74416H_HART_MCR(0), 1);
+		if (ret)
+			printf("%s:%d: error\n", __func__, __LINE__);
+
+		/* The RTS bit will be automatically cleared once the message transmission is
+		completed unless the AUTO_CLR_RTS bit is cleared */
+		while (1) {
+			ret = ad74416h_reg_read(ad74416h, AD74416H_HART_MCR(0),
+						&reg_read);
+			if (ret)
+				return ret;
+			if (reg_read == 0)
+				break;
+		}
+
+		k_msleep(500);
+
+		/* Monitor the HART_ALERT_STATUSn register for status alerts on the
+		progress of the HART communication */
+		ret = ad74416h_reg_read(ad74416h, AD74416H_HART_ALERT_STATUS(0),
+					&reg_read);
+		if (ret)
+			return ret;
+		printf("HART_ALERT_STATUS: 0x%02X\r\n", reg_read);
+
+		ret = ad74416h_reg_read(ad74416h, AD74416H_HART_RFC(0),
+					&byte_count);
+		if (ret)
+			return ret;
+		printf("Response (RX FIFO Byte Count: %d):\r\n", byte_count);
+
+		for (i = 0; i < byte_count; i++) {
+			ret = ad74416h_reg_read(ad74416h, AD74416H_HART_RX(0),
+						&reg_read);
+			if (ret)
+				return ret;
+			p_response->hipTPPDU[i] = (uint8_t)reg_read;
+		}
+
+		/* Build response for HART-IP Client */
+		p_rspHdr->version = HARTIP_PROTOCOL_VERSION;
+		p_rspHdr->msgType = HARTIP_MSG_TYPE_RESPONSE;
+		p_rspHdr->msgID = p_reqHdr->msgID;
+		p_rspHdr->status = NO_ERROR;
+		p_rspHdr->seqNum = p_reqHdr->seqNum;
+		p_rspHdr->byteCount = HARTIP_HEADER_LEN;
+
+		send_rsp_to_client(p_response, &ClientSessTable[sessNum]);
 	} while (FALSE);
 
 	return (errval);
